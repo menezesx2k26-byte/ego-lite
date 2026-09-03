@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, ftruncateSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 export type Ownership = "agent" | "agentDelegatedToUser" | "user";
@@ -17,6 +17,51 @@ type PersistedState = {
   currentId: number | null;
   spaces: TaskSpace[];
 };
+
+/**
+ * Task spaces emulated as tracked tab sets inside one shared browser profile,
+ * the same model PR #134/#202 use on Linux: the profile (and its logins) is
+ * shared, ownership and tab membership are host bookkeeping. State persists
+ * as JSON so spaces survive across CLI invocations — the browser holds the
+ * tabs, this registry holds which tab belongs to which space.
+ */
+function sleepSync(ms: number) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function writeStateFileInPlaceVerified(tempPath: string, statePath: string) {
+  const bytes = readFileSync(tempPath);
+  const fd = openSync(statePath, "r+");
+  try {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (written <= 0) throw new Error("EGO_STATE_INPLACE_WRITE_STALLED");
+      offset += written;
+    }
+    ftruncateSync(fd, bytes.length);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  if (!readFileSync(statePath).equals(bytes)) throw new Error("EGO_STATE_INPLACE_VERIFY_FAILED");
+  unlinkSync(tempPath);
+}
+
+export function replaceStateFile(tempPath: string, statePath: string, options: any = {}) {
+  const rename = options.rename || renameSync;
+  const writeTarget = options.writeTarget || writeStateFileInPlaceVerified;
+  const sleep = options.sleep || sleepSync;
+  const retries = options.retries ?? 12;
+  const baseDelayMs = options.baseDelayMs ?? 25;
+  for (let attempt = 0; ; attempt++) {
+    try { rename(tempPath, statePath); return; }
+    catch (error: any) {
+      const transient = ["EPERM", "EBUSY", "EACCES"].includes(error?.code);
+      if (!transient) throw error;
+      if (attempt >= retries) { writeTarget(tempPath, statePath); return; }
+      sleep(Math.min(baseDelayMs * (attempt + 1), 250));
+    }
+  }
+}
 
 /**
  * Task spaces emulated as tracked tab sets inside one shared browser profile,
@@ -192,6 +237,6 @@ export class TaskSpaceRegistry {
     // Atomic replace so a failed write leaves the previous state valid.
     const tempPath = `${this.statePath}.${process.pid}.tmp`;
     writeFileSync(tempPath, JSON.stringify(state, null, 2));
-    renameSync(tempPath, this.statePath);
+    replaceStateFile(tempPath, this.statePath);
   }
 }

@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { TaskSpaceRegistry } from "../dist/src/task-spaces.js";
+import { TaskSpaceRegistry, replaceStateFile } from "../dist/src/task-spaces.js";
 
 async function withRegistry(run) {
   const dir = await mkdtemp(join(tmpdir(), "ego-host-spaces-"));
@@ -116,4 +116,30 @@ test("remove clears the current selection when it was selected", async () => {
     assert.equal(registry.current(), null);
     assert.equal(registry.list().length, 0);
   });
+});
+
+test("state replace retries transient Windows rename failures", () => {
+  let attempts = 0;
+  const sleeps = [];
+  replaceStateFile("temp", "state", {
+    rename: () => {
+      attempts++;
+      if (attempts < 3) { const error = new Error("locked"); error.code = "EPERM"; throw error; }
+    },
+    writeTarget: () => { throw new Error("fallback should not run"); },
+    sleep: (ms) => sleeps.push(ms),
+    retries: 4,
+    baseDelayMs: 5,
+  });
+  assert.equal(attempts, 3);
+  assert.deepEqual(sleeps, [5, 10]);
+});
+
+test("state replace uses verified target fallback after persistent Windows locks", () => {
+  let fallback = 0;
+  replaceStateFile("temp", "state", {
+    rename: () => { const error = new Error("locked"); error.code = "EPERM"; throw error; },
+    writeTarget: () => { fallback++; }, sleep: () => {}, retries: 2, baseDelayMs: 1,
+  });
+  assert.equal(fallback, 1);
 });
